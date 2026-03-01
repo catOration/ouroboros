@@ -28,7 +28,8 @@ import traceback
 from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.utils import (
-    utc_now_iso, read_text, append_jsonl, clip_text,
+    utc_now_iso, read_text, append_jsonl,
+    clip_text,
     truncate_for_log, sanitize_tool_result_for_log, sanitize_tool_args_for_log,
 )
 from ouroboros.llm import LLMClient, DEFAULT_LIGHT_MODEL
@@ -394,85 +395,32 @@ class BackgroundConsciousness:
             "description": "Set how many seconds until your next thinking cycle. "
                            "Default 300. Range: 60-3600.",
             "parameters": {"type": "object", "properties": {
-                "seconds": {"type": "integer",
-                            "description": "Seconds until next wakeup (60-3600)"},
-            }, "required": ["seconds"]},
-        }, _set_next_wakeup))
+                "seconds": {"type": "integer", "minimum": 60, "maximum": 3600},
+            }},
+            "required": ["seconds"],
+            "callback": _set_next_wakeup,
+        }))
 
         return registry
 
-    def _tool_schemas(self) -> List[Dict[str, Any]]:
-        """Return tool schemas filtered to the consciousness whitelist."""
-        return [
-            s for s in self._registry.schemas()
-            if s.get("function", {}).get("name") in self._BG_TOOL_WHITELIST
-        ]
+    # -------------------------------------------------------------------
+    # Tool execution (simplified for consciousness)
+    # -------------------------------------------------------------------
 
-    def _execute_tool(self, tc: Dict[str, Any], all_pending_events: List[Dict[str, Any]]) -> str:
-        """Execute a consciousness tool call with timeout. Returns result string."""
-        fn_name = tc.get("function", {}).get("name", "")
-        if fn_name not in self._BG_TOOL_WHITELIST:
-            return f"Tool {fn_name} not available in background mode."
+    def _execute_tool(self, tool_call: Dict, pending_events: list) -> str:
+        """Execute a tool call in consciousness context."""
+        tool_name = tool_call.get("name", "")
+        args = tool_call.get("arguments", "")
+
+        if tool_name not in self._BG_TOOL_WHITELIST:
+            return f"Tool {tool_name} is not available in background consciousness."
+
+        # Use the registry to execute
         try:
-            args = json.loads(tc.get("function", {}).get("arguments", "{}"))
-        except (json.JSONDecodeError, ValueError):
-            return "Failed to parse arguments."
-
-        # Set chat_id context for send_owner_message
-        chat_id = self._owner_chat_id_fn()
-        self._registry._ctx.current_chat_id = chat_id
-        self._registry._ctx.pending_events = []
-
-        timeout_sec = 30
-        result = None
-        error = None
-
-        def _run_tool():
-            nonlocal result, error
-            try:
-                result = self._registry.execute(fn_name, args)
-            except Exception as e:
-                error = e
-
-        # Execute with timeout using ThreadPoolExecutor
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_run_tool)
-            try:
-                future.result(timeout=timeout_sec)
-            except concurrent.futures.TimeoutError:
-                result = f"[TIMEOUT after {timeout_sec}s]"
-                append_jsonl(self._drive_root / "logs" / "events.jsonl", {
-                    "ts": utc_now_iso(),
-                    "type": "consciousness_tool_timeout",
-                    "tool": fn_name,
-                    "timeout_sec": timeout_sec,
-                })
-
-        # Handle errors
-        if error is not None:
-            append_jsonl(self._drive_root / "logs" / "events.jsonl", {
-                "ts": utc_now_iso(),
-                "type": "consciousness_tool_error",
-                "tool": fn_name,
-                "error": repr(error),
-            })
-            result = f"Error: {repr(error)}"
-
-        # Accumulate pending events to the shared list
-        for evt in self._registry._ctx.pending_events:
-            all_pending_events.append(evt)
-
-        # Truncate result to 15000 chars (same as agent limit)
-        result_str = str(result)[:15000]
-
-        # Log to tools.jsonl (same format as loop.py)
-        args_for_log = sanitize_tool_args_for_log(fn_name, args)
-        append_jsonl(self._drive_root / "logs" / "tools.jsonl", {
-            "ts": utc_now_iso(),
-            "tool": fn_name,
-            "source": "consciousness",
-            "args": args_for_log,
-            "result_preview": sanitize_tool_result_for_log(truncate_for_log(result_str, 2000)),
-        })
-
-        return result_str
+            result = self._registry.execute(tool_name, args)
+            if isinstance(result, dict) and "event" in result:
+                pending_events.append(result["event"])
+            return str(result)
+        except Exception as e:
+            log.debug("Failed to execute tool %s: %s", tool_name, e)
+            return f"Error executing {tool_name}: {e}"
